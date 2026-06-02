@@ -135,6 +135,9 @@ pub use vc_store::{RedbVcStore, StoredVc, VcMetadata, VcOpening, VcStorage, VcSt
 pub use vc_store::InMemoryVcStore;
 pub use did_auth::{sign_for_authentication, DidAuthError};
 pub use oid4vp_client::{run_authentication as oid4vp_run_authentication, AuthFlowError};
-pub use oid4vci_client::{run_issuance as oid4vci_run_issuance, IssuanceFlowError};
+pub use oid4vci_client::{
+    run_issuance as oid4vci_run_issuance, IssuanceFlowError,
+    CredentialConfiguration, CredentialFlowError, CredentialIssuerMetadata, MetadataError, ProofTypeMetadata,
+};
 pub use vc_self_verify::{self_verify, self_verify_and_cache, InvalidReason, SelfVerifyResult};
 pub use qr_scanner::{QrScanner, QrScanError, PasteUrlScanner};

@@ -1,21 +1,16 @@
-//! `/credential` endpoint client + atomic `vc_store` landing.
+//! Birth-credential (legacy Compact VC) request/response flow.
 //!
-//! Flow:
-//! 1. Run `request_token` to get the access token + c_nonce.
-//! 2. Build a DID-bound JWS proof over the c_nonce (reusing the
-//!    SIOPv2 id_token shape from `oid4vp_client::jws`, with
-//!    `aud = issuer` and `nonce = c_nonce`).
-//! 3. POST `{format, proof: {proof_type: "jwt", jwt}}` to
-//!    `{issuer}/credential` with Bearer auth.
-//! 4. Decode the wire VC + openings, base64-decode the bodies,
-//!    and land everything in `vc_store` via the single-write-txn
-//!    `insert_vc_with_openings`.
+//! Drives `/token` → `/credential` with the simple `{format, proof}`
+//! request body and the legacy response shape
+//! `{credential: {vc_uri, issuer_did, holder_did, body_b64}, openings}`.
+//! The issuer assigns the `vc_uri`; all fields are plain JSON strings.
 
 use serde::Deserialize;
 
 use crate::clock::Clock;
-use crate::http::{HttpClient, HttpError};
+use crate::http::HttpClient;
 use crate::oid4vci_client::token::TokenResponse;
+use crate::oid4vci_client::credential::CredentialFlowError;
 use crate::oid4vp_client::build_id_token;
 use crate::secret_storage::SecretStorage;
 use crate::vc_store::{StoredVc, VcOpening, VcStorage};
@@ -43,30 +38,21 @@ pub struct OpeningWire {
     pub opening_b64: String,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum CredentialFlowError {
-    #[error("http: {0}")]
-    Http(#[from] HttpError),
-    #[error("non-2xx {status}: {body}")]
-    Status { status: u16, body: String },
-    #[error("decode: {0}")]
-    Decode(#[from] serde_json::Error),
-    #[error("base64: {0}")]
-    Base64(#[from] base64::DecodeError),
-    #[error("token error: {0}")]
-    Token(#[from] crate::oid4vci_client::token::Oid4vciTokenError),
-    #[error("proof JWS error: {0}")]
-    Proof(#[from] crate::oid4vp_client::IdTokenError),
-    #[error("vc_store: {0}")]
-    Store(String),
-}
-
-/// Drive the full Pre-Authorized Code Flow end-to-end:
+/// Drive the full Pre-Authorized Code Flow end-to-end for a
+/// birth-format credential:
 /// /token → /credential → land VC + openings in vc_store atomically.
+///
+/// All endpoint URLs, the credential `format`, and the
+/// `credential_issuer` come from the credential-issuer metadata
+/// document; callers extract them from `CredentialIssuerMetadata`
+/// before calling this function.
 pub async fn request_credential(
     http: &dyn HttpClient,
     clock: &dyn Clock,
-    issuer: &str,
+    credential_issuer: &str,
+    token_endpoint: &str,
+    credential_endpoint: &str,
+    format: &str,
     pre_authorized_code: &str,
     wallet: &Wallet,
     secret_store: &dyn SecretStorage,
@@ -77,34 +63,37 @@ pub async fn request_credential(
     use base64::Engine;
 
     let token: TokenResponse =
-        crate::oid4vci_client::token::request_token(http, issuer, pre_authorized_code).await?;
+        crate::oid4vci_client::token::request_token(http, token_endpoint, pre_authorized_code)
+            .await?;
 
-    // Build a DID-bound JWS over the c_nonce. The proof_type=jwt
-    // path of OID4VCI just reuses the SIOPv2 id_token shape, with
-    // `aud=issuer` and `nonce=c_nonce`.
+    // Build a DID-bound JWS proof over the c_nonce. Per OID4VCI,
+    // `aud` MUST be the `credential_issuer` URL from metadata.
     let proof_jwt = build_id_token(
         wallet,
         secret_store,
         clock,
         holder_did,
-        issuer,
+        credential_issuer, // aud = credential_issuer per OID4VCI
         &token.c_nonce,
         300,
     )
     .await?;
 
     let body = serde_json::json!({
-        "format": "midnight-vc-compact",
+        "format": format,
         "proof": {
             "proof_type": "jwt",
             "jwt": proof_jwt,
         },
     });
-    let url = format!("{}/credential", issuer.trim_end_matches('/'));
+    let url = credential_endpoint.to_string();
     let resp = http
         .post_json(&url, &body, Some(&token.access_token))
         .await?;
-    let text = resp.body_text()?.to_string();
+    let text = resp
+        .body_text()
+        .map_err(|e| CredentialFlowError::Http(e))?
+        .to_string();
     if !resp.is_success() {
         return Err(CredentialFlowError::Status {
             status: resp.status,
@@ -117,8 +106,9 @@ pub async fn request_credential(
         vc_uri: issued.credential.vc_uri.clone(),
         issuer_did: issued.credential.issuer_did,
         holder_did: issued.credential.holder_did,
-        format: "midnight-vc-compact".into(),
+        format: format.to_string(),
         body: B64.decode(&issued.credential.body_b64)?,
+        proof: vec![],
         issued_at_ms: clock.now_ms(),
     };
     let openings: Vec<VcOpening> = issued
@@ -194,7 +184,10 @@ mod tests {
         let vc_uri = request_credential(
             &http,
             &clock,
-            "https://issuer.local",
+            "https://issuer.local",           // credential_issuer (aud)
+            "https://issuer.local/token",       // token_endpoint
+            "https://issuer.local/credential",  // credential_endpoint
+            "midnight_compact_vc",
             "CODE-1",
             &wallet,
             &store,
@@ -225,7 +218,7 @@ mod tests {
         assert_eq!(rec[1].url, "https://issuer.local/credential");
         assert_eq!(rec[1].bearer.as_deref(), Some("AT"));
         let posted = rec[1].body.as_ref().expect("credential body");
-        assert_eq!(posted["format"], "midnight-vc-compact");
+        assert_eq!(posted["format"], "midnight_compact_vc");
         assert_eq!(posted["proof"]["proof_type"], "jwt");
         assert!(posted["proof"]["jwt"].is_string());
     }
